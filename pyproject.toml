@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "order-stream"
+version = "1.0.0"
+description = "Transactional order events with Kafka and PostgreSQL"
+requires-python = ">=3.9"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "psycopg[binary]>=3.2,<4", "confluent-kafka>=2.6,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "httpx>=0.27,<1", "ruff>=0.9"]
+
+[project.scripts]
+orderstream = "orderstream.cli:main"
+
+[tool.setuptools.package-data]
+orderstream = ["*.sql", "*.html"]
+[tool.setuptools.packages.find]
+include = ["orderstream*"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["integration: requires PostgreSQL and Kafka"]
+[tool.ruff]
+target-version = "py39"
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

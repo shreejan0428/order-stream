@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Order Stream</title>
+    <style>
+      body {
+        max-width: 900px;
+        margin: 36px auto;
+        padding: 0 20px;
+        font: 15px/1.6 system-ui;
+        color: #222;
+      }
+      h1 {
+        font-size: 26px;
+      }
+      h2 {
+        font-size: 20px;
+      }
+      input,
+      button {
+        font: inherit;
+        padding: 6px;
+        margin: 4px;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+      }
+      td,
+      th {
+        border-bottom: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
+      }
+      pre {
+        background: #f5f5f5;
+        padding: 12px;
+        overflow: auto;
+      }
+      #error {
+        color: #a00;
+      }
+      .scroll {
+        overflow: auto;
+      }
+      code {
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Order Event Processor</h1>
+    <p>PostgreSQL outbox → Kafka → idempotent consumer → sales summary</p>
+    <form id="form">
+      <label
+        >Amount (cents)
+        <input
+          id="amount"
+          type="number"
+          min="1"
+          max="100000000"
+          value="2500"
+          required /></label
+      ><label>Request key <input id="key" required maxlength="100" /></label
+      ><button>Create order</button>
+    </form>
+    <p>
+      Reuse the same request key and amount to test a retry. It should return
+      the same order.
+    </p>
+    <button id="refresh">Refresh results</button>
+    <p id="error" role="alert"></p>
+    <p id="last" aria-live="polite"></p>
+    <h2>Consumer summary</h2>
+    <pre id="summary">Loading…</pre>
+    <p>
+      The summary is eventually consistent. A pending outbox or stopped consumer
+      can delay updates.
+    </p>
+    <h2>Recent orders</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Amount</th>
+            <th>Status</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="orders"></tbody>
+      </table>
+    </div>
+    <h2>Failed events</h2>
+    <pre id="failures"></pre>
+    <script>
+      const key = document.querySelector("#key");
+      key.value = crypto.randomUUID();
+      async function request(url, options) {
+        const r = await fetch(url, options);
+        if (!r.ok) {
+          let message = "Request failed";
+          try {
+            const data = await r.json();
+            message =
+              typeof data.detail === "string"
+                ? data.detail
+                : JSON.stringify(data.detail);
+          } catch {}
+          throw Error(message);
+        }
+        return r.json();
+      }
+      async function refresh() {
+        try {
+          const [summary, orders, failures] = await Promise.all([
+            request("/api/summary"),
+            request("/api/orders"),
+            request("/api/failures"),
+          ]);
+          document.querySelector("#summary").textContent = JSON.stringify(
+            summary,
+            null,
+            2,
+          );
+          document.querySelector("#failures").textContent = JSON.stringify(
+            failures,
+            null,
+            2,
+          );
+          const rows = document.querySelector("#orders");
+          rows.replaceChildren();
+          for (const order of orders) {
+            const row = document.createElement("tr");
+            for (const value of [order.id, order.amount_cents, order.status]) {
+              const cell = document.createElement("td");
+              cell.textContent = value;
+              row.append(cell);
+            }
+            const cell = document.createElement("td");
+            const button = document.createElement("button");
+            button.textContent = "Cancel";
+            button.disabled = order.status === "cancelled";
+            button.onclick = async () => {
+              try {
+                await request(`/api/orders/${order.id}/cancel`, {
+                  method: "POST",
+                });
+                await refresh();
+              } catch (e) {
+                document.querySelector("#error").textContent = e.message;
+              }
+            };
+            cell.append(button);
+            row.append(cell);
+            rows.append(row);
+          }
+        } catch (e) {
+          document.querySelector("#error").textContent = e.message;
+        }
+      }
+      document.querySelector("#form").onsubmit = async (event) => {
+        event.preventDefault();
+        document.querySelector("#error").textContent = "";
+        try {
+          const order = await request("/api/orders", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              request_key: key.value,
+              amount_cents: Number(document.querySelector("#amount").value),
+            }),
+          });
+          document.querySelector("#last").textContent =
+            `Order ${order.id} (${order.status}). Change the request key for a new order.`;
+          await refresh();
+        } catch (e) {
+          document.querySelector("#error").textContent = e.message;
+        }
+      };
+      document.querySelector("#refresh").onclick = refresh;
+      refresh();
+    </script>
+  </body>
+</html>
