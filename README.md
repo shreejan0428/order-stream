@@ -1,113 +1,84 @@
-# Reliable Order Event Processor
+# Order Stream
 
-A Python service demonstrating PostgreSQL transactions, a transactional outbox, Kafka delivery, idempotent consumers, and replayable order summaries.
+An order event processing system built with Python, PostgreSQL, Kafka, and FastAPI. It handles order creation and cancellation, publishes changes through a transactional outbox, and maintains a separate summary of active order amounts.
 
-The application accepts order creation and cancellation. The consumer builds a separate summary of active order amounts. These are sample order totals, not actual payments or recognized revenue. The project uses integer cents and a deliberately small state machine: created version 1, cancelled version 2.
+The central requirement is that retries and worker crashes must not apply the same order update twice.
 
-## Run with Docker
+## Architecture
 
-Install Docker Desktop and run:
+```text
+Order API → PostgreSQL orders + outbox → Relay → Kafka
+                                                  ↓
+                                      Python consumer
+                                                  ↓
+                                  PostgreSQL order summary
+```
+
+The API writes an order and its outbox event in one transaction. The relay publishes pending events and marks them sent only after Kafka acknowledges delivery. The consumer records the event ID and updates the order projection in another transaction, then commits the Kafka offset.
+
+Delivery is at least once. Duplicate events are expected and handled through the database event ledger.
+
+## Failure handling
+
+- **Repeated requests:** a request key and database lock prevent concurrent retries from creating multiple orders. Reusing a key with a different amount returns a conflict.
+- **Interrupted publication:** pending outbox rows remain retryable. A crash after Kafka acknowledgment can cause redelivery, which the consumer handles idempotently.
+- **Consumer crashes:** a committed database update remains valid even if the corresponding Kafka offset was not committed.
+- **Out-of-order events:** full snapshots and version checks prevent an older creation event from reversing a cancellation.
+- **Invalid events:** malformed messages are recorded before their offsets are acknowledged. Transient database failures receive bounded retries.
+- **Replay:** a new consumer group can rebuild a separate projection from retained Kafka events.
+
+Implementation: [database operations](orderstream/storage.py), [relay and consumer](orderstream/broker.py), [schema](orderstream/schema.sql), and [design decisions](docs/DESIGN.md).
+
+## Testing and results
+
+The **14-test suite** covers validation, concurrent requests, transaction rollback, duplicate events, stale versions, failure storage, replay, and consumer lag. Integration tests run against real PostgreSQL and Kafka containers.
+
+The crash-recovery test terminates a worker **after the database commit and before the Kafka offset commit**. Restarting the group redelivers the event without changing the projected total.
+
+A local synthetic workload produced these results:
+
+| Check | Result |
+| --- | ---: |
+| Orders created | 100 |
+| Cancellations | 25 |
+| Events processed | 125 |
+| Events replayed | 125 |
+| Active amount before and after replay | 75,000 cents |
+| Create-order median / p95 | 7.83 / 12.05 ms |
+
+The workload verifies behavior on a single broker; it is not a production throughput or availability benchmark. Amounts represent sample orders, not payment processing.
+
+[Benchmark results](benchmarks/results.json) · [Integration tests](tests/test_integration.py) · [Validation details](docs/VALIDATION.md)
+
+## Run locally
+
+With Docker installed:
 
 ```sh
 docker compose up --build -d
 ```
 
-Open http://localhost:8020. API documentation is at http://localhost:8020/docs.
+Open [localhost:8020](http://localhost:8020), or [the API documentation](http://localhost:8020/docs). Compose starts PostgreSQL, Kafka, the API, the outbox relay, and the consumer.
 
-The stack starts a dedicated PostgreSQL database, a single Kafka broker, an initialization job, the API, an outbox relay, and a consumer. Ports bind to localhost. Local demonstration credentials are in Compose; there are no cloud credentials. Kafka and PostgreSQL data persist in named volumes. `docker compose down` stops the stack without deleting those volumes.
+Submitting the same request key and amount returns the same order. Cancelling an order updates the summary asynchronously. PostgreSQL and Kafka data persist in Docker volumes.
 
-## Try the behavior
-
-1. Create a 2500-cent order with a request key such as `demo-order-1`.
-2. Submit the same key and amount again. The order ID stays the same.
-3. Reuse that key with a different amount. The API returns a conflict.
-4. Refresh until the consumer summary includes the order.
-5. Cancel it. Refresh until active totals decrease. Cancelling it again does not create another version.
-
-To see eventual consistency, stop the worker with `docker compose stop consumer`, create another order, then run `docker compose start consumer`. The summary catches up. It is normal for the source orders and the derived summary to differ briefly.
-
-## Run Python locally
-
-Python 3.11 is recommended; 3.9+ is supported.
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-docker compose up -d postgres kafka
-orderstream init
-uvicorn orderstream.api:app --port 8020
-```
-
-In two additional activated terminals run `orderstream relay` and `orderstream consume`. Do not run a local API on port 8020 while the Compose API is using it.
-
-Defaults are PostgreSQL `localhost:55432`, Kafka `localhost:19092`, and topic `order-events`. Override with `DATABASE_URL`, `KAFKA_BOOTSTRAP`, and `KAFKA_TOPIC`. Each outbox row retains its destination topic so unrelated test/demo topics cannot receive each other's pending events.
-
-## Guarantees and failure handling
-
-- The API writes the order and outbox event in the same PostgreSQL transaction.
-- Repeated create requests use a request key. An advisory lock serializes competing requests using that key.
-- The relay locks pending rows with `FOR UPDATE SKIP LOCKED` and marks a row published only after Kafka acknowledges it.
-- A crash between broker acknowledgment and the database update can publish a duplicate. Producer idempotence does not eliminate this cross-system window.
-- The consumer records the event ID and updates the projection in one transaction. Only afterward does it commit the Kafka offset.
-- Events contain complete order snapshots. A newer version supersedes an older version; stale snapshots cannot resurrect a cancelled order.
-- Malformed events are stored in PostgreSQL's `failed_events` table before acknowledging their offsets. Transient database errors are retried three times. If failure storage is unavailable, processing fails without acknowledging the offset.
-
-This is at-least-once delivery with idempotent database effects per projection. It does not claim a global exactly-once transaction across Kafka and PostgreSQL. Event deduplication assumes producer-stable event IDs and retains processed IDs indefinitely.
+For local Python setup, replay commands, configuration, and benchmarks, see [setup and usage](docs/SETUP.md).
 
 ## Tests
 
-```sh
-pytest -q
-RUN_INTEGRATION=1 pytest -q
-```
-
-The first command runs unit checks and skips external-service tests. The second requires real PostgreSQL and Kafka and tests concurrent create retries, outbox rollback, duplicate snapshots, stale versions, API validation, actual process death, offset redelivery, failed-event storage, and replay.
-
-Tests use unique Kafka topics, request keys, and projection names; they do not truncate tables. They leave small test records/topics for inspection. Run against a disposable development stack. For a clean container-based check after starting the stack:
+With the Docker stack running:
 
 ```sh
 docker compose run --rm -e RUN_INTEGRATION=1 api pytest -q
 ```
 
-## Replay
+GitHub Actions builds the application image, checks the Python code, and runs the integration suite with PostgreSQL and Kafka.
 
-Replay into a fresh projection and a fresh consumer group:
+## Limitations
 
-```sh
-orderstream consume --group review-rebuild-1 --projection review-rebuild-1 --timeout 30
-orderstream summary --projection review-rebuild-1
-```
+The current order lifecycle is creation followed by optional cancellation. Events contain full snapshots, rather than arbitrary state changes. The local stack uses one broker and does not test broker failover. Deduplication records are retained indefinitely, and replay depends on Kafka retention. Public deployment, authentication, and automated failed-event redrive are outside the current scope.
 
-Increase the timeout for larger histories. A timed run can stop before catching up, so compare projected counts with expected source counts before calling a rebuild complete. New groups begin at the earliest retained Kafka offset. Replay depends on Kafka retention; the outbox is retained for inspection, but there is no automatic archive restoration command.
+## References
 
-To inspect failed records, open `/api/failures`. After fixing a malformed source event, publish a valid event with a new event ID; failed records remain an audit trail. This version does not have an automatic failed-event redrive UI.
-
-Use `orderstream lag` to inspect committed offsets and lag for the live group. This is a read-only snapshot and does not move offsets.
-
-## Benchmark
-
-```sh
-python benchmarks/run.py
-```
-
-This creates 100 synthetic orders and 25 cancellations, relays 125 events, consumes them, and replays them into the same projection. It checks that the final active amount remains 75000 cents and records duplicate deliveries. It writes `benchmarks/results.json`. Timings include local connection overhead and consumer startup; this is a bounded correctness workload, not a saturation or production-scale benchmark.
-
-## Source map
-
-- `orderstream/storage.py`: SQL transactions, validation, projection updates, and summaries.
-- `orderstream/broker.py`: outbox publication, retries, consumption, and offset commits.
-- `orderstream/schema.sql`: tables, constraints, and indexes.
-- `orderstream/api.py`: order endpoints and browser demonstration.
-- `orderstream/cli.py`: initialization, workers, and replay options.
-- `tests/test_integration.py`: real broker/database failure scenarios.
-
-See `docs/DESIGN.md` and `docs/VALIDATION.md` for decisions, evidence, and limits.
-
-## Scope and references
-
-The project extends the distributed streaming system topic from the supplied Python project list. The implementation uses [Confluent's Python client documentation](https://docs.confluent.io/kafka-clients/python/current/overview.html) and [PostgreSQL transaction documentation](https://www.postgresql.org/docs/current/tutorial-transactions.html).
-
-This local stack has one broker and no authentication, TLS, payment gateway, inventory reservation, or multi-node failover. It demonstrates worker recovery, not broker high availability. Keep it local unless you add the deployment controls required for your environment.
-
-For the tested Python 3.11 dependency versions, install with `pip install -c requirements-tested.txt -e ".[dev]"`. The snapshot records the environment used during validation.
+- [Confluent Python client documentation](https://docs.confluent.io/kafka-clients/python/current/overview.html)
+- [PostgreSQL transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html)
